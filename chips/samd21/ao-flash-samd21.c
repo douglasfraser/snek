@@ -49,7 +49,7 @@ ao_flash_is_locked(void *addr)
 /* Execute a single flash operation, waiting for it to complete. This
  * bit of code must be in ram
  */
-static void __attribute__ ((section(".ramtext"),noinline))
+static void __attribute__ ((section(".sdata2.flash"),noinline))
 _ao_flash_execute(uint16_t cmd)
 {
 	while ((samd21_nvmctrl.intflag & (1 << SAMD21_NVMCTRL_INTFLAG_READY)) == 0)

@@ -16,115 +16,162 @@
  * 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
  */
 
-MEMORY {
-	rom (rx) :   ORIGIN = 0x00002000, LENGTH = 128K - 8K
-	flash (rw) : ORIGIN = 0x00020000, LENGTH = 64K
-	ram (!w) :   ORIGIN = 0x20000000, LENGTH = 32K - 2K
-	stack (!w) : ORIGIN = 0x20000000 + 32K - 2K, LENGTH = 2K
+ENTRY(_start)
+
+__flash      = 0x00002000;
+__flash_size = 128K - 8K;
+__ram        = 0x20000000;
+__ram_size   = 32k;
+__stack_size = 2k;
+
+MEMORY
+{
+	flash (rxai!w) : ORIGIN = DEFINED(__flash) ? __flash : 0x10000000, LENGTH = DEFINED(__flash_size) ? __flash_size : 0x10000
+	storage (rw) : ORIGIN = 0x00020000, LENGTH = 64K
+	ram (wxa!ri)   : ORIGIN = DEFINED(__ram  ) ? __ram   : 0x20000000, LENGTH = DEFINED(__ram_size  ) ? __ram_size   : 0x08000
 }
 
 PHDRS
 {
-	rom PT_LOAD;
+	text PT_LOAD;
 	ram PT_LOAD;
 	ram_init PT_LOAD;
 	tls PT_TLS;
 }
 
-SECTIONS {
-	/*
-	 * Rom contents
-	 */
+SECTIONS
+{
+	PROVIDE(__stack = ORIGIN(ram) + LENGTH(ram));
+
+	.init : {
+		KEEP (*(.text.init.enter))
+		KEEP (*(.data.init.enter))
+		KEEP (*(SORT_BY_NAME(.init) SORT_BY_NAME(.init.*)))
+	} >flash AT>flash :text
 
 	.text : {
-		__text_start = .;
 
-		KEEP(*(.interrupt))	/* interrupt vectors */
-
+                /* code */
 		*(.text.unlikely .text.unlikely.*)
 		*(.text.startup .text.startup.*)
 		*(.text .text.*)
 		*(.gnu.linkonce.t.*)
-	} > rom :rom
+		KEEP (*(.fini))
+		__text_end = .;
 
-	.ARM.exidx : {
-		*(.ARM.exidx* .gnu.linkonce.armexidx.*)
-	} > rom :rom
+	        PROVIDE (__etext = __text_end);
+	        PROVIDE (_etext = __text_end);
+	        PROVIDE (etext = __text_end);
 
-	.rodata : {
+                /* read-only data */
+		*(.rdata)
 		*(.rodata .rodata.*)
 		*(.gnu.linkonce.r.*)
-		. = ALIGN(8);
+
 		*(.srodata.cst16)
 		*(.srodata.cst8)
 		*(.srodata.cst4)
 		*(.srodata.cst2)
 		*(.srodata .srodata.*)
-	} > rom :rom
+		*(.data.rel.ro .data.rel.ro.*)
+		*(.got .got.*)
 
-	. = ALIGN(8);
+                /* Need to pre-align so that the symbols come after padding */
+		. = ALIGN(8);
 
-	__text_end = .;
+                /* lists of constructors and destructors */
+		PROVIDE_HIDDEN ( __preinit_array_start = . );
+		KEEP (*(.preinit_array))
+		PROVIDE_HIDDEN ( __preinit_array_end = . );
 
-	/* Functions placed in RAM (required for flashing) */
+		PROVIDE_HIDDEN ( __init_array_start = . );
+		KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))
+		KEEP (*(.init_array .ctors))
+		PROVIDE_HIDDEN ( __init_array_end = . );
 
-	.textram : ALIGN_WITH_INPUT {
-		PROVIDE(__data_start = .);
-		*(.ramtext)
-	} >ram AT>rom :ram_init
-	PROVIDE(__data_source = LOADADDR(.textram));
+		PROVIDE_HIDDEN ( __fini_array_start = . );
+		KEEP (*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
+		KEEP (*(.fini_array .dtors))
+		PROVIDE_HIDDEN ( __fini_array_end = . );
+	} >flash AT>flash :text
 
-	/* Data -- relocated to RAM, but written to ROM */
+        /* additional sections when compiling with C++ exception support */
+	/*
+        .except_ordered : {
+		*(.gcc_except_table *.gcc_except_table.*)
+		KEEP (*(.eh_frame .eh_frame.*))
+		*(.ARM.extab* .gnu.linkonce.armextab.*)
+	} >flash AT>flash :text
+
+	.except_unordered : {
+                . = ALIGN(8);
+
+        	PROVIDE(__exidx_start = .);
+		*(.ARM.exidx*)
+        	PROVIDE(__exidx_end = .);
+        } >flash AT>flash :text
+	*/
+
+	/*
+	 * Data values which are preserved across reset
+	 */
+	.preserve (NOLOAD) : {
+		PROVIDE(__preserve_start__ = .);
+		KEEP(*(SORT_BY_NAME(.preserve.*)))
+		KEEP(*(.preserve))
+		PROVIDE(__preserve_end__ = .);
+	} >ram AT>ram :ram
+
 	.data : ALIGN_WITH_INPUT {
+
 		PROVIDE(__snek_data_start = .);
 		snek*(.data .data.*)
 		__snek_data_end = .;
+
 		*(.data .data.*)
+		*(.gnu.linkonce.d.*)
+
+                /* Need to pre-align so that the symbols come after padding */
+ 		. = ALIGN(8);
+
+		PROVIDE( __global_pointer$ = . + 0x800 );
 		*(.sdata .sdata.* .sdata2.*)
 		*(.gnu.linkonce.s.*)
-	} >ram AT>rom :ram_init
+	} >ram AT>flash :ram_init
+	PROVIDE(__data_start = ADDR(.data));
+	PROVIDE(__data_source = LOADADDR(.data));
 	PROVIDE(__snek_data_source = LOADADDR(.data));
 	PROVIDE(__snek_data_size = __snek_data_end - __snek_data_start);
 
-	/* Place .tdata initialization values in rom
-	 * These will be after the regular data initialization
-	 * and when copied will be placed in .tdata_space.
-	 * Allocate addresses in ram so that we can make sure
-	 * there is space. Not that this means the ram
-	 *
-	 * The .tbss segment must immediately follow the .tdata
-	 * segment or the linker complains about them not beingn
-	 * adjacent
+	/* Thread local initialized data. This gets
+	 * space allocated as it is expected to be placed
+	 * in ram to be used as a template for TLS data blocks
+	 * allocated at runtime. We're slightly abusing that
+	 * by placing the data in flash where it will be copied
+	 * into the allocate ram addresses by the existing
+	 * data initialization code in crt0
 	 */
 	.tdata : ALIGN_WITH_INPUT {
-		PROVIDE(__tls_base = .);
 		*(.tdata .tdata.* .gnu.linkonce.td.*)
-		__data_end = .;
-	} >ram AT>rom :tls :ram_init
-
-	PROVIDE(__tdata_source = LOADADDR(.tdata));
-	PROVIDE(__tdata_size = SIZEOF(.tdata));
+		PROVIDE(__data_end = .);
+	} >ram AT>flash :tls :ram_init
+	PROVIDE( __tls_base = ADDR(.tdata));
+	PROVIDE( __tdata_source = LOADADDR(.tdata) );
+	PROVIDE( __tdata_size = SIZEOF(.tdata) );
 
 	PROVIDE( __edata = __data_end );
 	PROVIDE( _edata = __data_end );
 	PROVIDE( edata = __data_end );
-	PROVIDE(__data_size = __data_end - __data_start);
+	PROVIDE( __data_size = __data_end - __data_start );
 
-	/* Assign .tbss symbols addresses in rom so that they have the
-	 * right values to make them fall right after the .tdata
-	 * symbols. When linked, the resulting relocations will be
-	 * written with correct values. I think this relies on the
-	 * .tbss segment not being large enough to overflow the rom
-	 * memory area
-	 */
-	.tbss : {
-		PROVIDE(__bss_start = .);
-		*( .tbss .tbss.* .gnu.linkonce.tb.* )
-		*( .tcommon .tcommon.* )
-		PROVIDE(__tls_end = .);
+	.tbss (NOLOAD) : {
+		*(.tbss .tbss.* .gnu.linkonce.tb.*)
+		*(.tcommon)
+		PROVIDE( __tls_end = . );
 	} >ram AT>ram :tls :ram
-	PROVIDE(__tbss_size = SIZEOF(.tbss));
-	PROVIDE(__tls_size = __tls_end - __tls_base);
+	PROVIDE( __bss_start = ADDR(.tbss));
+	PROVIDE( __tbss_size = SIZEOF(.tbss) );
+	PROVIDE( __tls_size = __tls_end - __tls_base );
 
 	/*
 	 * The linker special cases .tbss segments which are
@@ -135,34 +182,53 @@ SECTIONS {
 	 * across them.  We actually need memory allocated for tbss,
 	 * so we create a special segment here just to make room
 	 */
-	.tbss_space : {
+	.tbss_space (NOLOAD) : {
 		. = . + __tbss_size;
 	} >ram AT>ram :ram
 
-	.bss : {
+	.bss (NOLOAD) : {
 		PROVIDE(__snek_bss_start = .);
 		snek*( .bss .bss.* )
 		snek*(COMMON)
 		__snek_bss_end = .;
-		*( .bss .bss.*)
+		*(.sbss*)
+		*(.gnu.linkonce.sb.*)
+		*(.bss .bss.*)
+		*(.gnu.linkonce.b.*)
 		*(COMMON)
+
+                /* Align the heap */
+		. = ALIGN(8);
 		__bss_end = .;
-		PROVIDE(end = .);
 	} >ram AT>ram :ram
 	PROVIDE( __end = __bss_end );
 	PROVIDE( _end = __bss_end );
 	PROVIDE( end = __bss_end );
 	PROVIDE( __bss_size = __bss_end - __bss_start );
-
 	PROVIDE(__snek_bss_size = (__snek_bss_end - __snek_bss_start));
-	PROVIDE(__bss_size = __bss_end - __bss_start);
 
-	PROVIDE(__stack = ORIGIN(stack) + LENGTH(stack));
+	/* Make the rest of memory available for heap storage */
+	PROVIDE (__heap_start = __end);
+	PROVIDE (__heap_end = __stack - (DEFINED(__stack_size) ? __stack_size : 0x800));
+	PROVIDE (__heap_size = __heap_end - __heap_start);
 
-	PROVIDE(__flash__ = ORIGIN(flash));
-	PROVIDE(__flash_end__ = ORIGIN(flash) + LENGTH(flash));
+	/* Define a stack region to make sure it fits in memory */
+	.stack (NOLOAD) : {
+		. += (DEFINED(__stack_size) ? __stack_size : 0x800);
+	} >ram :ram
+
+	/* Throw away C++ exception handling information */
+
+	
+
+	/DISCARD/ : {
+		*(.note .note.*)
+		*(.eh_frame .eh_frame.*)
+		*(.ARM.extab* .gnu.linkonce.armextab.*)
+		*(.ARM.exidx*)
+	}
+
+	
+	PROVIDE(__flash__ = ORIGIN(storage));
+	PROVIDE(__flash_end__ = ORIGIN(storage) + LENGTH(storage));
 }
-
-ENTRY(_start);
-
-
